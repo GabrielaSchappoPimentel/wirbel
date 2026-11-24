@@ -6,6 +6,8 @@ import time
 
 import pygame
 
+USAR_TECLADO = True  # SO PARA TESTE sem controle. Use False no uso real.
+
 IP_CARRO = "192.168.4.1"
 PORTA = 4210
 
@@ -65,8 +67,14 @@ def ler_telemetria(sock, enviados):
         if len(dados) != TAM_TEL or dados[0] != MAGIC_TEL:
             continue
         _, eco, estado, vbat_mv, thr, steer, brk, rx = struct.unpack(FORMATO_TEL, dados)
-        tel = {"estado": estado, "vbat_mv": vbat_mv, "thr": thr,
-               "steer": steer, "brk": brk, "rx": rx}
+        tel = {
+            "estado": estado,
+            "vbat_mv": vbat_mv,
+            "thr": thr,
+            "steer": steer,
+            "brk": brk,
+            "rx": rx,
+        }
         t_envio = enviados.get(eco)
         if t_envio is not None:
             atraso = (time.monotonic() - t_envio) * 1000
@@ -85,6 +93,13 @@ def linha(tela, fonte, texto, y):
     tela.blit(fonte.render(texto, True, (230, 230, 230)), (10, y))
 
 
+def aproximar(valor, alvo, passo):
+    """Move 'valor' em direcao a 'alvo' no maximo 'passo' por chamada."""
+    if valor < alvo:
+        return min(valor + passo, alvo)
+    return max(valor - passo, alvo)
+
+
 def main():
     os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
     pygame.init()
@@ -98,7 +113,7 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     destino = (IP_CARRO, PORTA)
-    enviados = {}   # seq -> instante do envio (para medir o atraso)
+    enviados = {}  # seq -> instante do envio (para medir o atraso)
 
     controle = None
     seq = 0
@@ -107,6 +122,7 @@ def main():
     t_ultima_tel = 0.0
     erro_rede = False
     rodando = True
+    tec_throttle = tec_steer = tec_brake = 0.0
 
     while rodando:
         agora = time.monotonic()
@@ -122,8 +138,20 @@ def main():
         if controle is not None:
             throttle = gatilho_para_pct(controle.get_axis(EIXO_RT))
             brake = gatilho_para_pct(controle.get_axis(EIXO_LT))
-            steer = round(zona_morta(controle.get_axis(EIXO_DIRECAO),
-                                     ZONA_MORTA_DIRECAO) * 100)
+            steer = round(
+                zona_morta(controle.get_axis(EIXO_DIRECAO), ZONA_MORTA_DIRECAO) * 100
+            )
+        elif USAR_TECLADO:
+            teclas = pygame.key.get_pressed()
+            alvo_dir = (teclas[pygame.K_RIGHT] - teclas[pygame.K_LEFT]) * 100
+            tec_steer = aproximar(tec_steer, alvo_dir, 4)
+            tec_throttle = aproximar(tec_throttle, 100 if teclas[pygame.K_UP] else 0, 5)
+            tec_brake = aproximar(tec_brake, 100 if teclas[pygame.K_DOWN] else 0, 20)
+            throttle, steer, brake = (
+                round(tec_throttle),
+                round(tec_steer),
+                round(tec_brake),
+            )
         else:
             throttle, steer, brake = 0, 0, 100
 
@@ -132,10 +160,10 @@ def main():
         try:
             sock.sendto(pacote, destino)
             erro_rede = False
-        except OSError:          # ex.: notebook fora do Wi-Fi do carro
+        except OSError:  # ex.: notebook fora do Wi-Fi do carro
             erro_rede = True
         enviados[seq & 0xFFFF] = agora
-        enviados.pop((seq - 200) & 0xFFFF, None)   # guarda so ~4 s de historico
+        enviados.pop((seq - 200) & 0xFFFF, None)  # guarda so ~4 s de historico
         seq += 1
 
         # ---- Receber ----
@@ -164,15 +192,40 @@ def main():
         if tel_ok:
             vbat = tel["vbat_mv"]
             cor_bat = VERDE if vbat >= 6600 else (LARANJA if vbat >= 6200 else VERMELHO)
-            barra(tela, fonte, "Bateria", vbat, 6000, 8400, 170, cor_bat,
-                  f"{vbat / 1000:.2f} V")
-            linha(tela, fonte, f"Carro aplicou: acel {tel['thr']}  "
-                               f"freio {tel['brk']}  dir {tel['steer']:+d}", 210)
+            barra(
+                tela,
+                fonte,
+                "Bateria",
+                vbat,
+                6000,
+                8400,
+                170,
+                cor_bat,
+                f"{vbat / 1000:.2f} V",
+            )
+            linha(
+                tela,
+                fonte,
+                f"Carro aplicou: acel {tel['thr']}  "
+                f"freio {tel['brk']}  dir {tel['steer']:+d}",
+                210,
+            )
             perda = max(0, 100 - tel["rx"] * 100 / HZ)
-            linha(tela, fonte, f"Link: {tel['rx']}/{HZ} pacotes/s  (perda {perda:.0f}%)", 235)
+            linha(
+                tela,
+                fonte,
+                f"Link: {tel['rx']}/{HZ} pacotes/s  (perda {perda:.0f}%)",
+                235,
+            )
             atraso_txt = "--" if atraso_ms is None else f"{atraso_ms:.0f} ms"
             linha(tela, fonte, f"Atraso do eco: {atraso_txt}", 260)
-        linha(tela, fonte, "Controle: " + ("CONECTADO" if controle else "SEM CONTROLE"), 295)
+            if controle:
+                modo = "CONECTADO"
+        elif USAR_TECLADO:
+            modo = "TECLADO (teste): setas"
+        else:
+            modo = "SEM CONTROLE"
+        linha(tela, fonte, "Controle: " + modo, 295)
         linha(tela, fonte, f"Pacote: {pacote.hex(' ')}", 320)
         pygame.display.flip()
 

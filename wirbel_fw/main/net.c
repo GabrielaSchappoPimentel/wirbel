@@ -12,9 +12,11 @@
 #include "lwip/sockets.h"
 
 #include "config.h"
+#include "control.h"
 #include "net.h"
 #include "protocol.h"
 #include "secrets.h"
+#include "util.h"
 
 static const char *TAG = "net";
 
@@ -35,7 +37,6 @@ static void evento_wifi(void *arg, esp_event_base_t base, int32_t id, void *dado
 
 static void wifi_ap_init(void)
 {
-    // O driver Wi-Fi guarda dados de calibracao na NVS (memoria nao volatil)
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -45,7 +46,7 @@ static void wifi_ap_init(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();   // cria a interface de rede do AP (IP 192.168.4.1)
+    esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -69,7 +70,9 @@ static void wifi_ap_init(void)
     ESP_LOGI(TAG, "SoftAP no ar: SSID=%s canal=%d IP=192.168.4.1", WIFI_SSID, WIFI_CANAL);
 }
 
-static void udp_rx_task(void *arg)
+// Recebe comandos e envia telemetria. As duas coisas usam o mesmo socket,
+// entao ficam na mesma task (mais simples que dividir).
+static void udp_task(void *arg)
 {
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
@@ -90,40 +93,72 @@ static void udp_rx_task(void *arg)
         return;
     }
 
-    // Sem pacote por 1 s, o recvfrom() retorna (-1) em vez de travar para sempre
-    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    // Espera no maximo 20 ms por pacote: o laco roda ~50x/s mesmo sem comandos
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 20000 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     ESP_LOGI(TAG, "UDP escutando na porta %d", UDP_PORTA);
 
     uint8_t buf[32];
-    cmd_pacote_t ultimo = {0};
+    struct sockaddr_in cliente = {0};
+    bool tem_cliente = false;
     uint32_t rx_janela = 0;
-    TickType_t t_janela = xTaskGetTickCount();
+    uint32_t rx_por_s = 0;
+    uint32_t t_janela = agora_ms();
+    uint32_t t_tel = agora_ms();
 
     while (true) {
-        int n = recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
+        struct sockaddr_in origem;
+        socklen_t origem_len = sizeof(origem);
+        int n = recvfrom(sock, buf, sizeof(buf), 0,
+                         (struct sockaddr *)&origem, &origem_len);
 
         if (n == (int)sizeof(cmd_pacote_t)) {
             cmd_pacote_t p;
             memcpy(&p, buf, sizeof(p));
-            if (p.magic == MAGIC_CMD) {
-                ultimo = p;
+            if (p.magic == MAGIC_CMD && control_novo_comando(&p)) {
+                cliente = origem;   // a telemetria volta para quem mandou
+                tem_cliente = true;
                 rx_janela++;
             }
         }
 
-        if ((xTaskGetTickCount() - t_janela) >= pdMS_TO_TICKS(1000)) {
-            if (rx_janela > 0) {
-                ESP_LOGI(TAG, "rx %lu/s | seq=%u acel=%u dir=%d freio=%u",
-                         (unsigned long)rx_janela, (unsigned)ultimo.seq,
-                         (unsigned)ultimo.throttle, (int)ultimo.steer,
-                         (unsigned)ultimo.brake);
-            } else {
-                ESP_LOGW(TAG, "rx 0/s (sem comandos)");
-            }
+        uint32_t agora = agora_ms();
+
+        // ---- Telemetria a 10 Hz ----
+        if (tem_cliente && (uint32_t)(agora - t_tel) >= TELEMETRIA_PERIODO_MS) {
+            t_tel = agora;
+            control_snapshot_t s;
+            control_snapshot(&s);
+            tel_pacote_t t = {
+                .magic    = MAGIC_TEL,
+                .seq_eco  = s.seq_eco,
+                .estado   = (uint8_t)s.estado,
+                .vbat_mv  = s.vbat_mv,
+                .throttle = s.throttle,
+                .steer    = s.steer,
+                .brake    = s.brake,
+                .rx_por_s = (uint8_t)(rx_por_s > 255 ? 255 : rx_por_s),
+            };
+            sendto(sock, &t, sizeof(t), 0, (struct sockaddr *)&cliente, sizeof(cliente));
+        }
+
+        // ---- Janela de 1 s: taxa de pacotes e log ----
+        if ((uint32_t)(agora - t_janela) >= 1000) {
+            rx_por_s = rx_janela;
             rx_janela = 0;
-            t_janela = xTaskGetTickCount();
+            t_janela = agora;
+
+            control_snapshot_t s;
+            control_snapshot(&s);
+            if (rx_por_s > 0) {
+                ESP_LOGI(TAG, "rx %lu/s | %s | acel=%u dir=%d freio=%u drs=%u%%",
+                         (unsigned long)rx_por_s, control_nome_estado(s.estado),
+                         (unsigned)s.throttle, (int)s.steer, (unsigned)s.brake,
+                         (unsigned)s.drs_pct);
+            } else {
+                ESP_LOGW(TAG, "rx 0/s (sem comandos) | %s", control_nome_estado(s.estado));
+            }
         }
     }
 }
@@ -131,5 +166,5 @@ static void udp_rx_task(void *arg)
 void net_init(void)
 {
     wifi_ap_init();
-    xTaskCreate(udp_rx_task, "udp_rx", 4096, NULL, 5, NULL);
+    xTaskCreate(udp_task, "udp", 4096, NULL, 5, NULL);
 }
