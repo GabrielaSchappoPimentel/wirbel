@@ -70,8 +70,6 @@ static void wifi_ap_init(void)
     ESP_LOGI(TAG, "SoftAP no ar: SSID=%s canal=%d IP=192.168.4.1", WIFI_SSID, WIFI_CANAL);
 }
 
-// Recebe comandos e envia telemetria. As duas coisas usam o mesmo socket,
-// entao ficam na mesma task (mais simples que dividir).
 static void udp_task(void *arg)
 {
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
@@ -106,6 +104,7 @@ static void udp_task(void *arg)
     uint32_t rx_por_s = 0;
     uint32_t t_janela = agora_ms();
     uint32_t t_tel = agora_ms();
+    uint32_t t_log = agora_ms();
 
     while (true) {
         struct sockaddr_in origem;
@@ -143,21 +142,23 @@ static void udp_task(void *arg)
             sendto(sock, &t, sizeof(t), 0, (struct sockaddr *)&cliente, sizeof(cliente));
         }
 
-        // ---- Janela de 1 s: taxa de pacotes e log ----
+        // ---- Janela de 1 s: taxa de pacotes ----
         if ((uint32_t)(agora - t_janela) >= 1000) {
             rx_por_s = rx_janela;
             rx_janela = 0;
             t_janela = agora;
+        }
 
+        // ---- Log a cada 5 s (menos poluicao durante a calibracao) ----
+        if ((uint32_t)(agora - t_log) >= 5000) {
+            t_log = agora;
             control_snapshot_t s;
             control_snapshot(&s);
-            if (rx_por_s > 0) {
-                ESP_LOGI(TAG, "rx %lu/s | %s | acel=%u dir=%d freio=%u drs=%u%%",
+            if (!s.calibrando) {
+                ESP_LOGI(TAG, "rx %lu/s | %s | vbat=%u mV acel=%u dir=%d freio=%u drs=%u%%",
                          (unsigned long)rx_por_s, control_nome_estado(s.estado),
-                         (unsigned)s.throttle, (int)s.steer, (unsigned)s.brake,
-                         (unsigned)s.drs_pct);
-            } else {
-                ESP_LOGW(TAG, "rx 0/s (sem comandos) | %s", control_nome_estado(s.estado));
+                         (unsigned)s.vbat_mv, (unsigned)s.throttle, (int)s.steer,
+                         (unsigned)s.brake, (unsigned)s.drs_pct);
             }
         }
     }

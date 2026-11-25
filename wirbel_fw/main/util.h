@@ -9,3 +9,8 @@ static inline uint32_t agora_ms(void)
 {
     return (uint32_t)(((uint64_t)xTaskGetTickCount() * 1000ULL) / configTICK_RATE_HZ);
 }
+
+static inline int limitar(int v, int min, int max)
+{
+    return v < min ? min : (v > max ? max : v);
+}
